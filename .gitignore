@@ -1,0 +1,37 @@
+# Default deny: only reviewed source files may be published.
+*
+!/.gitignore
+!/README.md
+!/LICENSE
+!/package.json
+!/package-lock.json
+!/Start-Bridge.ps1
+!/启动.cmd
+!/扫码绑定.cmd
+!/停止桥接.cmd
+!/检查连接.cmd
+
+!/src/
+!/src/activity.mjs
+!/src/bridge.mjs
+!/src/catalog.py
+!/src/cli.mjs
+!/src/codes.mjs
+!/src/desktop.mjs
+!/src/ipc.mjs
+!/src/questions.mjs
+!/src/requests.mjs
+!/src/weixin.mjs
+
+!/test/
+!/test/bridge.test.mjs
+!/test/features.test.mjs
+
+# Reviewed synthetic illustrations only; all other images remain excluded.
+!/docs/
+!/docs/images/
+!/docs/images/usage-preview.png
+!/docs/images/usage-preview.svg
+
+# Everything else stays local, including data, config, logs, caches,
+# build/test output, temporary files, dependencies and ZIP archives.

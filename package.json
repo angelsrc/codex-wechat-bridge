@@ -1,0 +1,9 @@
+{
+  "name": "codex-wechat-bridge",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20.18" },
+  "scripts": { "start": "node src/cli.mjs start", "login": "node src/cli.mjs login", "doctor": "node src/cli.mjs doctor", "test": "node --test" },
+  "dependencies": { "qrcode": "1.5.4" }
+}
