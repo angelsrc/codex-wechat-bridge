@@ -12,12 +12,18 @@ export class Bridge {
     this.desktop = desktop; this.messenger = messenger; this.log = log;
     this.nextCode = nextCode;
     this.store = store; this.notifying = new Set(); this.chatBusy = new Set();
-    this.entries = new Map(); this.codes = new Map(); this.busy = new Set(); this.queue = Promise.resolve();
+    this.entries = new Map(); this.codes = new Map(); this.busy = new Set(); this.queue = Promise.resolve(); this.notificationEpoch = 0;
     desktop.on('state', thread => this.observe(thread));
     desktop.on('unavailable', thread => { for (const entry of this.entries.values()) if (entry.threadId === thread.id && entry.hostId === thread.hostId) entry.available = false; });
   }
-  enqueue(task) { this.queue = this.queue.then(task).catch(error => this.log(`微信发送失败：${error.message}`)); return this.queue; }
-  async send(text) { for (const part of splitMessage(text)) await this.messenger.send(part); }
+  enqueue(task) {
+    const epoch = this.notificationEpoch, current = () => epoch === this.notificationEpoch && this.messenger.ready;
+    this.queue = this.queue.then(() => task(current)).catch(error => this.log(`微信发送失败：${error.message}`)); return this.queue;
+  }
+  async send(text, current = () => true) {
+    for (const part of splitMessage(text)) { if (!current()) return false; await this.messenger.send(part); }
+    return current();
+  }
   observe(thread) {
     const chat = this.store.observe(thread);
     const active = new Set();
@@ -32,16 +38,17 @@ export class Bridge {
         this.log(`发现待处理请求 ${code} (${request.method})`);
       }
       entry.available = true; entry.title = thread.state.title;
-      if (!entry.announced && !entry.resolved && !entry.announcing && this.messenger.ready) {
-        entry.announcing = true;
-        this.enqueue(async () => {
+      if (entry.announcedEpoch !== this.notificationEpoch && !entry.resolved && !entry.submitted && !entry.announcing && this.messenger.ready) {
+        const announcing = Symbol(); entry.announcing = announcing;
+        this.enqueue(async current => {
           try {
-            if (entry.resolved) return;
-            await this.send(renderRequest(entry)); entry.announced = true;
+            const actionable = () => current() && !entry.resolved && entry.available && !entry.submitted;
+            if (!await this.send(renderRequest(entry), actionable)) return;
+            entry.announced = true; entry.announcedEpoch = this.notificationEpoch;
             const quickReply = quickApprovalReply(entry);
-            if (quickReply && !entry.resolved && entry.available) await this.send(quickReply);
+            if (quickReply) await this.send(quickReply, actionable);
           }
-          finally { entry.announcing = false; }
+          finally { if (entry.announcing === announcing) entry.announcing = false; }
         });
       }
     }
@@ -49,7 +56,7 @@ export class Bridge {
       if (entry.hostId !== thread.hostId || entry.threadId !== thread.id || entry.resolved || active.has(entry.key)) continue;
       entry.resolved = true; entry.available = false; entry.resolvedAt = Date.now();
       this.log(`请求 ${entry.code} 已结束`);
-      if (entry.announced) this.enqueue(() => this.send(`Codex【${entry.code}】已处理或已结束，后续回复不再生效。`));
+      if (entry.announcedEpoch === this.notificationEpoch) this.enqueue(current => this.send(`Codex【${entry.code}】已处理或已结束，后续回复不再生效。`, current));
     }
     // Keep recent tombstones for clear replies, without growing for the lifetime of the service.
     for (const [key, entry] of this.entries) if (entry.resolvedAt < Date.now() - 86400000) { this.entries.delete(key); this.codes.delete(entry.code); }
@@ -60,13 +67,29 @@ export class Bridge {
     for (const notification of this.store.data.outbox) {
       if (this.notifying.has(notification.key)) continue;
       this.notifying.add(notification.key);
-      this.enqueue(async () => {
-        try { await this.send(renderCompletion(notification)); this.store.delivered(notification.key); }
+      this.enqueue(async current => {
+        try {
+          const pending = () => current() && this.store.data.outbox.includes(notification);
+          if (await this.send(renderCompletion(notification), pending)) this.store.delivered(notification.key);
+        }
         finally { this.notifying.delete(notification.key); }
       });
     }
   }
-  notifyReady() { for (const thread of this.desktop.threads.values()) if (thread.fresh) this.observe(thread); this.flushNotifications(); }
+  notifyReady({ reconnect = false } = {}) {
+    if (reconnect) {
+      this.notificationEpoch++;
+      for (const entry of this.entries.values()) if (!entry.resolved) {
+        entry.announcing = false; entry.available = false;
+      }
+    }
+    for (const thread of this.desktop.threads.values()) if (thread.fresh) this.observe(thread);
+    if (reconnect) {
+      const discarded = this.store.discardNotifications();
+      this.log(`微信消息上下文已刷新；清理 ${discarded} 条积压结果通知，仅同步当前待处理审批和问题。`);
+    }
+    this.flushNotifications();
+  }
   pending() { return [...this.entries.values()].filter(e => !e.resolved); }
   threadFor(chat) { return this.desktop.threads.get(`${chat.hostId}:${chat.id}`); }
   renderStatus() {

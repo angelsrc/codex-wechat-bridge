@@ -186,6 +186,37 @@ test('HTTP and business errors stay visible without including bot credentials', 
   await assert.rejects(api.request('endpoint', { body: {}, token: 'supersecret' }), /微信接口错误 -14/);
 });
 
+test('rejected send context pauses retries and an inbound message restores pending-only synchronization', async () => {
+  let calls = 0, refreshed = 0; const logs = [];
+  const messenger = new WeixinMessenger({
+    account: { userId: 'me' }, state: { contextToken: 'old' }, log: text => logs.push(text),
+    api: { request: async () => { calls++; throw Object.assign(Error('微信接口错误 -2'), { code: -2 }); } },
+  });
+  await assert.rejects(messenger.send('first'), /-2/); assert.equal(messenger.ready, false);
+  await assert.rejects(messenger.send('retry'), /发送“连接”/); assert.equal(calls, 1); assert.equal(logs.length, 1);
+  messenger.api.request = async () => { calls++; };
+  await messenger.consume({ message_id: '1', from_user_id: 'me', message_type: 1, context_token: 'new', item_list: [{ type: 1, text_item: { text: '状态' } }] }, async text => {
+    assert.equal(refreshed, 1); assert.equal(text, '状态'); await messenger.send('状态回复');
+  }, options => { assert.deepEqual(options, { reconnect: true }); refreshed++; });
+  assert.equal(messenger.ready, true); assert.equal(calls, 2);
+});
+
+test('ordinary network errors do not mark the WeChat context rejected', async () => {
+  const messenger = new WeixinMessenger({ account: { userId: 'me' }, state: { contextToken: 'context' }, api: { request: async () => { throw Error('network offline'); } } });
+  await assert.rejects(messenger.send('hello'), /network offline/); assert.equal(messenger.ready, true);
+});
+
+test('a late failure from an old context cannot reject the newly refreshed context', async () => {
+  let rejectOld, calls = 0;
+  const messenger = new WeixinMessenger({ account: { userId: 'me' }, state: { contextToken: 'old' }, api: { request: async () => {
+    if (++calls === 1) await new Promise((_resolve, reject) => { rejectOld = reject; });
+  } } });
+  const oldSend = assert.rejects(messenger.send('old'), /-2/);
+  await messenger.consume({ message_id: '1', from_user_id: 'me', message_type: 1, context_token: 'new', item_list: [{ type: 1, text_item: { text: '连接' } }] }, async () => {}, () => {});
+  rejectOld(Object.assign(Error('微信接口错误 -2'), { code: -2 })); await oldSend;
+  assert.equal(messenger.ready, true); assert.equal(messenger.state.contextToken, 'new');
+});
+
 test('uint64 message IDs stay exact while message text is untouched', () => {
   const raw = '{"msgs":[{"message_id":18446744073709551614,"text":"\\\"message_id\\\":123"},{"message_id":18446744073709551615}]}';
   const data = parseApiJson(raw);

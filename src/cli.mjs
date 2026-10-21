@@ -79,7 +79,7 @@ async function start() {
   const desktop = new Desktop({ catalog });
   const messenger = new WeixinMessenger({ account, state: await readJson('weixin-state.json', {}), saveState: value => saveJson('weixin-state.json', value), log });
   const bridge = new Bridge({ desktop, messenger, log, nextCode: createCodeGenerator(path.join(dataDir, 'code-sequence.json')), store: new BridgeStore(path.join(dataDir, 'bridge-state.json')) });
-  const status = { version: '0.2.0', startedAt: new Date().toISOString(), desktop: 'connecting', threads: 0, pending: 0, wechatContextReady: messenger.ready };
+  const status = { version: '0.2.1', startedAt: new Date().toISOString(), desktop: 'connecting', threads: 0, pending: 0, wechatContextReady: messenger.ready };
   let statusWrite = Promise.resolve();
   const saveStatus = () => { statusWrite = statusWrite.then(() => saveJson('status.json', { ...status, threads: [...desktop.threads.values()].filter(t => t.fresh).length, pending: [...bridge.entries.values()].filter(e => !e.resolved && e.available).length, wechatContextReady: messenger.ready })).catch(error => log(`状态文件更新失败：${error.message}`)); };
   desktop.on('status', text => { status.desktop = text; log(`桌面通信：${text}`); saveStatus(); });
@@ -87,14 +87,14 @@ async function start() {
   desktop.on('state', saveStatus);
   let stopping = false;
   let stopTimer;
-  const notificationTimer = setInterval(() => bridge.flushNotifications(), 15000);
+  const notificationTimer = setInterval(() => { bridge.flushNotifications(); saveStatus(); }, 15000);
   const stop = async () => { if (stopping) return; stopping = true; clearInterval(stopTimer); clearInterval(notificationTimer); messenger.stop(); desktop.stop(); status.desktop = 'stopped'; saveStatus(); await statusWrite; await unlock(); log('桥接已停止；桌面 Codex 继续正常工作。'); };
   stopTimer = setInterval(async () => { try { const request = await readJson('stop-request.json', null); if (request?.pid === process.pid) { await fs.unlink(path.join(dataDir, 'stop-request.json')); await stop(); } } catch (error) { log(`停止请求读取失败：${error.message}`); } }, 1000);
   process.once('SIGINT', stop); process.once('SIGTERM', stop);
   try {
     log('启动微信桥接。桌面弹窗正常出现，微信独立收发。按 Ctrl+C 停止桥接。');
     await desktop.start();
-    await messenger.poll(text => bridge.onText(text), () => { bridge.notifyReady(); saveStatus(); });
+    await messenger.poll(text => bridge.onText(text), options => { bridge.notifyReady(options); saveStatus(); });
   } finally { await stop(); }
 }
 

@@ -79,6 +79,14 @@ export class BridgeStore {
     this.data.outbox = this.data.outbox.filter(n => n.key !== key);
     this.data.delivered.push(key); this.data.delivered = this.data.delivered.slice(-5000); this.save();
   }
+  discardNotifications() {
+    const count = this.data.outbox.length;
+    if (!count) return 0;
+    // Remember discarded turns as handled so later snapshots/restarts cannot replay them.
+    this.data.delivered = [...new Set([...this.data.delivered, ...this.data.outbox.map(n => n.key)])].slice(-5000);
+    this.data.outbox = []; this.save();
+    return count;
+  }
 }
 
 export function renderCompletion(notification) {

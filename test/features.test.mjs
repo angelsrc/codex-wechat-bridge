@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { Bridge } from '../src/bridge.mjs';
 import { Desktop, projectState, applyRequestPatches } from '../src/desktop.mjs';
 import { BridgeStore, conversationTurns, renderCompletion } from '../src/activity.mjs';
+import { WeixinMessenger } from '../src/weixin.mjs';
 
 const command = id => ({ id, method: 'item/commandExecution/requestApproval', params: { command: 'npm test' } });
 const turn = (status = 'inProgress', extra = {}) => ({ turnId: 'turn-1', status, turnStartedAtMs: Date.now(), items: [], ...extra });
@@ -130,6 +131,96 @@ test('failed delivery is retained and can be retried without duplicate queued se
   h.messenger.send = async text => h.messages.push(text);
   h.bridge.flushNotifications(); h.bridge.flushNotifications(); await h.bridge.queue;
   assert.equal(h.messages.length, 1); assert.equal(h.store.data.outbox.length, 0);
+});
+
+test('reconnect discards result backlog and persists suppression across snapshots and restart', async () => {
+  const root = fileURLToPath(new URL('..', import.meta.url)), dir = fs.mkdtempSync(path.join(root, 'test-state-')), file = path.join(dir, 'state.json');
+  try {
+    let h = setup({ store: new BridgeStore(file), ready: false });
+    h.update('a', state([turn()])); h.update('a', state([turn('completed')]));
+    h.update('b', state([turn()])); h.update('b', state([turn('failed')]));
+    assert.equal(h.store.data.outbox.length, 2);
+    h.messenger.ready = true; h.bridge.notifyReady({ reconnect: true }); await h.bridge.queue;
+    assert.equal(h.messages.length, 0); assert.equal(h.store.data.outbox.length, 0);
+    h.update('a', state([turn('completed')])); await h.bridge.queue; assert.equal(h.messages.length, 0);
+    h = setup({ store: new BridgeStore(file) });
+    h.update('a', state([turn('completed')])); h.update('b', state([turn('failed')]));
+    h.bridge.notifyReady(); await h.bridge.queue;
+    assert.equal(h.messages.length, 0); assert.equal(h.store.data.outbox.length, 0);
+  } finally { fs.unlinkSync(file); fs.rmdirSync(dir); }
+});
+
+test('reconnect reannounces actionable approvals and questions, skipping ended, unavailable and submitted requests', async () => {
+  const h = setup(); h.update('a', state([], [command('a')]));
+  h.update('b', state([], [{ id: 'q', method: 'item/tool/requestUserInput', params: { questions: [{ id: 'q1', question: '选哪个？' }] } }]));
+  h.update('c', state([], [command('c')]));
+  const d = h.update('d', state([], [command('d')])); h.update('e', state([], [command('e')]));
+  await h.bridge.queue;
+  h.update('c', state()); await h.bridge.queue;
+  d.fresh = false; h.desktop.emit('unavailable', d); h.bridge.codes.get('105').submitted = true;
+  h.messages.length = 0; h.bridge.notifyReady({ reconnect: true }); await h.bridge.queue;
+  assert.equal(h.messages.length, 3);
+  assert.match(h.messages[0], /等待审批【101】/); assert.equal(h.messages[1], '同意101'); assert.match(h.messages[2], /需要回答【102】/);
+});
+
+test('reconnect cancels queued historical results and ended requests while new results still notify', async () => {
+  const h = setup(); h.update('a', state([], [command('r')])); await h.bridge.queue; h.messages.length = 0;
+  let release; const gate = new Promise(resolve => { release = resolve; }); h.bridge.enqueue(() => gate);
+  h.update('b', state([turn()])); h.update('b', state([turn('completed')]));
+  h.update('a', state()); h.update('c', state([], [command('stale')])); h.update('c', state());
+  h.bridge.notifyReady({ reconnect: true });
+  h.update('d', state([turn()])); h.update('d', state([turn('completed')]));
+  release(); await h.bridge.queue;
+  assert.equal(h.messages.length, 1); assert.match(h.messages[0], /本轮完成【聊天4】/);
+});
+
+test('reconnect stops remaining chunks of an old result already in flight', async () => {
+  const h = setup(); let release, started;
+  const gate = new Promise(resolve => { release = resolve; }), sending = new Promise(resolve => { started = resolve; });
+  h.messenger.send = async text => { h.messages.push(text); started(); await gate; };
+  h.update('a', state([turn()]));
+  h.update('a', state([turn('completed', { items: [{ type: 'agentMessage', phase: 'final_answer', text: '结果'.repeat(900) }] })]));
+  await sending; h.bridge.notifyReady({ reconnect: true }); release(); await h.bridge.queue;
+  assert.equal(h.messages.length, 1); assert.match(h.messages[0], /^\(1\/2\)/); assert.equal(h.store.data.outbox.length, 0);
+});
+
+test('reconnect during an approval send reannounces it once without a stale quick reply', async () => {
+  const h = setup(); let release, started;
+  const gate = new Promise(resolve => { release = resolve; }), sending = new Promise(resolve => { started = resolve; });
+  h.messenger.send = async text => { h.messages.push(text); if (h.messages.length === 1) { started(); await gate; } };
+  h.update('a', state([], [command('r')])); await sending;
+  h.bridge.notifyReady({ reconnect: true }); h.update('a', state([], [command('r')]));
+  release(); await h.bridge.queue;
+  assert.equal(h.messages.filter(m => m.includes('等待审批【101】')).length, 2);
+  assert.equal(h.messages.filter(m => m === '同意101').length, 1);
+  assert.equal(h.bridge.codes.get('101').announcing, false);
+});
+
+test('an approval handled on desktop after reconnect is not replayed', async () => {
+  const h = setup(); h.update('a', state([], [command('r')])); await h.bridge.queue; h.messages.length = 0;
+  let release; const gate = new Promise(resolve => { release = resolve; }); h.bridge.enqueue(() => gate);
+  h.bridge.notifyReady({ reconnect: true }); h.update('a', state());
+  release(); await h.bridge.queue; assert.equal(h.messages.length, 0);
+});
+
+test('a previously announced sole approval still accepts an unnumbered reply during reconnect', async () => {
+  const h = setup(); h.update('a', state([], [command('r')])); await h.bridge.queue;
+  h.bridge.notifyReady({ reconnect: true }); await h.bridge.onText('同意'); await h.bridge.queue;
+  assert.equal(h.replies.length, 1); assert.equal(h.replies[0].entry.threadId, 'a');
+});
+
+test('WeChat connect discards queued backlog before persistence or acknowledgment can yield', async () => {
+  const h = setup(); h.update('a', state([turn()])); h.update('a', state([turn('completed')]));
+  const sent = [], messenger = new WeixinMessenger({
+    account: { userId: 'me' }, state: { contextToken: 'old' },
+    api: { request: async (_endpoint, options) => { sent.push(options.body.msg); } },
+    saveState: async () => { await Promise.resolve(); },
+  });
+  h.bridge.messenger = messenger;
+  await messenger.consume({ message_id: '1', from_user_id: 'me', message_type: 1, context_token: 'new', item_list: [{ type: 1, text_item: { text: '连接' } }] }, text => h.bridge.onText(text), options => h.bridge.notifyReady(options));
+  await h.bridge.queue;
+  assert.equal(sent.length, 1); assert.match(sent[0].item_list[0].text_item.text, /积压结果通知已清理/);
+  assert.equal(sent[0].context_token, 'new'); assert.equal(h.store.data.outbox.length, 0);
 });
 
 test('result state, selected chat, and pending notifications survive restart', async () => {

@@ -3,7 +3,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 export const API_BASE = 'https://ilinkai.weixin.qq.com';
 const CHANNEL_VERSION = '2.4.8';
-const BASE_INFO = { channel_version: CHANNEL_VERSION, bot_agent: 'CodexWeChatBridge/0.2.0' };
+const BASE_INFO = { channel_version: CHANNEL_VERSION, bot_agent: 'CodexWeChatBridge/0.2.1' };
 
 export function parseApiJson(raw) {
   // WeChat message IDs are uint64; keep their exact decimal representation for deduplication.
@@ -51,12 +51,21 @@ export class WeixinApi {
 
 export class WeixinMessenger {
   constructor({ api = new WeixinApi(), account, state = {}, saveState = async () => {}, log = console.log }) {
-    this.api = api; this.account = account; this.state = state; this.saveState = saveState; this.log = log; this.stopped = false; this.seen = new Set(state.seen ?? []);
+    this.api = api; this.account = account; this.state = state; this.saveState = saveState; this.log = log; this.stopped = false; this.seen = new Set(state.seen ?? []); this.contextRejected = false;
   }
-  get ready() { return Boolean(this.account && this.state.contextToken); }
+  get ready() { return Boolean(this.account && this.state.contextToken && !this.contextRejected); }
   async send(text) {
     if (!this.ready) throw Error('请先在微信 ClawBot 中发送“连接”，建立消息上下文');
-    await this.api.request('ilink/bot/sendmessage', { base: this.account.baseUrl, token: this.account.token, body: { msg: { from_user_id: '', to_user_id: this.account.userId, client_id: `codex_${randomUUID()}`, message_type: 2, message_state: 2, context_token: this.state.contextToken, item_list: [{ type: 1, text_item: { text } }] }, base_info: BASE_INFO } });
+    const contextToken = this.state.contextToken;
+    try {
+      await this.api.request('ilink/bot/sendmessage', { base: this.account.baseUrl, token: this.account.token, body: { msg: { from_user_id: '', to_user_id: this.account.userId, client_id: `codex_${randomUUID()}`, message_type: 2, message_state: 2, context_token: contextToken, item_list: [{ type: 1, text_item: { text } }] }, base_info: BASE_INFO } });
+    } catch (error) {
+      if (error.code === -2 && this.state.contextToken === contextToken && !this.contextRejected) {
+        this.contextRejected = true;
+        this.log('微信发送返回 -2；已暂停主动推送，请在微信发送“连接”刷新后重试。');
+      }
+      throw error;
+    }
   }
   async consume(message, onText, onReady) {
     if (message.message_type !== 1 || message.from_user_id !== this.account.userId) return;
@@ -65,12 +74,14 @@ export class WeixinMessenger {
     if (this.seen.has(key)) return;
     this.seen.add(key); if (this.seen.size > 1000) this.seen.delete(this.seen.values().next().value);
     const wasReady = this.ready;
-    if (message.context_token) this.state.contextToken = message.context_token;
-    this.state.seen = [...this.seen]; await this.saveState(this.state);
     const text = (message.item_list ?? []).filter(item => item.type === 1 && typeof item.text_item?.text === 'string').map(item => item.text_item.text).join('\n');
+    if (message.context_token) { this.state.contextToken = message.context_token; this.contextRejected = false; }
+    // Cut over synchronously, before any await lets queued notifications use the refreshed context.
+    if (text.trim() === '连接' || !wasReady && this.ready) onReady?.({ reconnect: true });
+    this.state.seen = [...this.seen]; await this.saveState(this.state);
     if (!text) return;
-    if (text.trim() === '连接') { await this.send('Codex 微信桥接已连接。桌面端照常使用；审批、提问和完成/失败结果会同步到这里。发送“状态”查看聊天，“待处理”查看审批和问题，“帮助”查看用法。'); onReady?.(); }
-    else { if (!wasReady && this.ready) onReady?.(); await onText(text); }
+    if (text.trim() === '连接') await this.send('Codex 微信桥接已连接。积压结果通知已清理，仅同步当前待处理的审批和问题；后续新产生的完成/失败结果继续提醒。桌面端照常使用。发送“状态”查看聊天，“待处理”查看审批和问题，“帮助”查看用法。');
+    else await onText(text);
   }
   async poll(onText, onReady) {
     this.controller = new AbortController(); let failures = 0;
