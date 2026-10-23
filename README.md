@@ -2,6 +2,11 @@
 
 在当前 Windows Codex 桌面实例旁运行，通过微信 ClawBot 收发审批、问题回答、完成/失败提醒，并继续已有聊天。当前版本：`0.2.1`。
 
+> [!IMPORTANT]
+> **登录自启提醒：** 按下文“[启用登录自启](#启用登录自启)”配置后，会在当前 Windows 用户的启动文件夹中添加 `Codex WeChat Bridge.lnk`，以后每次登录 Windows 都会在后台启动桥接。
+>
+> 登录自启需要手动启用，普通启动命令只负责本次运行。取消时按 `Win + R`，输入 `shell:startup`，删除这个快捷方式即可。
+
 ![Codex 微信桥接使用效果：审批与问答、状态查询、完成失败提醒、微信续聊](docs/images/usage-preview.png)
 
 > 使用效果示意图，消息内容为示例。图片源文件：[SVG](docs/images/usage-preview.svg)。
@@ -21,6 +26,7 @@
 | 查看状态与待处理清单 | 查看已同步聊天的编号、名称和运行状态，以及待审批、待回答的项目和回复方式。 |
 | 微信继续已有聊天 | 选择聊天后直接发送文字，或带聊天编号发送指令；执行中追加消息，空闲时开启下一回合，并继承桌面聊天的模型、目录和审批设置。 |
 | 桌面与微信并行 | 桌面弹窗即时出现，两端均可处理；提交前复查桌面状态，已结束请求不再提交，多聊天请求分别编号。 |
+| 登录自启（手动配置） | 配置当前用户的启动快捷方式，登录 Windows 后后台启动桥接；启动脚本会清理失效旧锁，重复启动沿用现有桥接进程。 |
 
 适用于当前 Windows 电脑上由 Codex 桌面持有、已加载的本地聊天。当前不支持微信创建新聊天、语音和图片输入；后续开发项见文末。
 
@@ -58,7 +64,7 @@
 
 - 首次扫码绑定并启动桥接后，发送一次“连接”。
 - 一段时间没有互动后，如果微信收不到通知或日志提示发送返回 `-2`，发送“连接”刷新。微信新消息携带上下文时也会刷新，所以发送“状态”或“待处理”同样可以恢复；恢复时会清理积压结果。
-- 短暂断网由桥接自动重试。重启电脑或桥接后，保存的上下文仍可用时无需手动连接；失效后再发送即可。
+- 短暂断网由桥接自动重试。重启电脑后，先通过登录自启或手动方式启动桥接；保存的上下文仍可用时无需再发送“连接”，失效后再发送即可。
 - 微信账号凭证失效（例如接口返回 `-14`）时，需重新扫码绑定，再发送“连接”。
 
 腾讯公开协议未承诺消息上下文的固定有效时长，因此没有设置“每隔多少分钟必须重连”的规则。桥接无法仅靠本地定时器生成新的微信消息上下文。
@@ -95,6 +101,27 @@ node .\src\cli.mjs doctor
 扫码二维码显示在终端，也保存在 `data/wechat-login.png`。若微信要求配对码，在扫码终端输入。已绑定的同一副本无需每次扫码；微信回复异常时先发 `连接` 刷新上下文，凭证失效后再重新扫码。
 
 后台日志：`data/service.log`；错误日志：`data/service-error.log`；摘要状态：`data/status.json`。后台重启时旧日志按时间重命名保留。
+
+### 启用登录自启
+
+完成依赖安装和扫码绑定后，在**项目根目录的 PowerShell 7** 中执行以下命令。它会创建或更新当前用户启动文件夹内的 `Codex WeChat Bridge.lnk`，从下次登录 Windows 起后台启动桥接：
+
+```powershell
+$bridgeDir = (Get-Location).Path
+$pwshExe = (Get-Command pwsh.exe -ErrorAction Stop).Source
+$startupDir = [Environment]::GetFolderPath('Startup')
+$shortcutPath = Join-Path $startupDir 'Codex WeChat Bridge.lnk'
+$shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcutPath)
+$shortcut.TargetPath = $pwshExe
+$shortcut.Arguments = '-NoProfile -NonInteractive -WindowStyle Hidden -File "' + (Join-Path $bridgeDir 'Start-Bridge.ps1') + '"'
+$shortcut.WorkingDirectory = $bridgeDir
+$shortcut.WindowStyle = 7
+$shortcut.Save()
+```
+
+快捷方式保存的是本机程序和项目的绝对路径；移动项目目录或 PowerShell 后，需在新位置重新配置。桥接自启后仍需打开 Codex 桌面，才能同步桌面聊天。
+
+**取消登录自启：** 按 `Win + R`，输入 `shell:startup`，删除 `Codex WeChat Bridge.lnk`。这只取消之后的自动启动；停止当前桥接可使用 `停止桥接.cmd`。本机生成的快捷方式保留在用户启动文件夹，不上传仓库。
 
 ## 适用范围与限制
 
@@ -138,4 +165,4 @@ node .\src\cli.mjs doctor
 1. 手机查看文件改动、测试和错误的按需摘要，以及完整最终回复。
 2. 微信语音转需求、图片/截图输入。
 3. 在微信中选择项目并创建新聊天。
-4. 开机自启、连接自检、通知设置与免打扰。
+4. 连接自检、通知设置与免打扰。

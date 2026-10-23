@@ -4,9 +4,18 @@ $taskData = Join-Path $PSScriptRoot 'data'
 New-Item -ItemType Directory -Path $taskData -Force | Out-Null
 $taskLockPath = Join-Path $taskData 'bridge.lock'
 if (Test-Path -LiteralPath $taskLockPath) {
+    $taskLockFile = Get-Item -LiteralPath $taskLockPath
     $taskLock = Get-Content -LiteralPath $taskLockPath -Raw | ConvertFrom-Json
-    if (Get-Process -Id $taskLock.pid -ErrorAction SilentlyContinue) { throw 'Bridge is already running.' }
+    $taskOwner = Get-Process -Id $taskLock.pid -ErrorAction SilentlyContinue
+    # A PID may belong to another process after reboot; only accept the original Node process.
+    if ($taskOwner -and $taskOwner.ProcessName -eq 'node' -and $taskOwner.StartTime.ToUniversalTime() -le $taskLockFile.LastWriteTimeUtc) {
+        Write-Output 'Bridge is already running.'
+        return
+    }
+    Remove-Item -LiteralPath $taskLockPath
 }
+$taskStopPath = Join-Path $taskData 'stop-request.json'
+if (Test-Path -LiteralPath $taskStopPath) { Remove-Item -LiteralPath $taskStopPath }
 $taskStamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
 foreach ($taskLog in @('service.log', 'service-error.log')) {
     $taskLogPath = Join-Path $taskData $taskLog
